@@ -1,0 +1,3 @@
+PS C:\Users\navig> ssh johnfaustin@51.210.243.77
+johnfaustin@51.210.243.77's password:
+Welcome to Ubuntu 22.04.5 LTS (GNU/Linux 5.15.0-135-generic x86_64)

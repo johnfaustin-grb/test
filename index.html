@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shady Finder - Votre itinéraire ombragé et dynamique</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&display=swap" rel="stylesheet">
+
+    <!-- Mapbox GL JS -->
+    <script src='https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js'></script>
+    <link href='https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css' rel='stylesheet' />
+
+    <!-- Style de la page -->
+    <style>
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; }
+        #map { flex-grow: 1; background-color: #f0f0f0; }
+        .control-panel { padding: 15px; background-color: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.15); z-index: 1000; display: flex; gap: 12px; align-items: center; justify-content: center; flex-wrap: wrap; border-bottom: 1px solid #ddd; }
+        .control-panel input { padding: 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 16px; flex-grow: 1; min-width: 220px; }
+        .control-panel button { padding: 12px 22px; background-color: #007bff; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }
+        .control-panel button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .loader { font-size: 16px; color: #555; }
+        .mapboxgl-popup-content { font-family: 'Roboto', sans-serif; font-size: 14px; padding: 10px 15px; }
+        .legend { position: absolute; bottom: 30px; right: 10px; padding: 10px; background: rgba(255,255,255,0.9); box-shadow: 0 0 15px rgba(0,0,0,0.2); border-radius: 8px; z-index: 1; font-size: 14px; }
+        .legend h4 { margin: 0 0 10px 0; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 5px; }
+        .legend-color { width: 18px; height: 18px; border-radius: 50%; margin-right: 8px; }
+    </style>
+</head>
+<body>
+
+    <div class="control-panel">
+        <input type="text" id="startInput" value="Musée du Louvre, Paris" placeholder="Adresse de départ...">
+        <input type="text" id="endInput" value="Cathédrale Notre-Dame de Paris" placeholder="Adresse d'arrivée...">
+        <button id="routeBtn">Trouver l'Itinéraire Ombragé</button>
+        <div id="loader" class="loader" style="display: none;">Calcul en cours...</div>
+    </div>
+    <div id="map"></div>
+    <div id="legend" class="legend">
+        <h4>Niveau d'Ombre</h4>
+        <div class="legend-item"><span class="legend-color" style="background: #ffc107;"></span>Très Ensoleillé</div>
+        <div class="legend-item"><span class="legend-color" style="background: #f57c00;"></span>Peu Ombragé</div>
+        <div class="legend-item"><span class="legend-color" style="background: #7b1fa2;"></span>Assez Ombragé</div>
+        <div class="legend-item"><span class="legend-color" style="background: #4a0072;"></span>Très Ombragé</div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            mapboxgl.accessToken = 'pk.eyJ1Ijoic2hhZHlmaW5kZXIiLCJhIjoiY21ldHUwYXBuMDAzNjJqc2Rvb2psbGwxZCJ9.Mp_3J4c1jIp3wcXuAx2oOQ'; 
+
+            const map = new mapboxgl.Map({
+                container: 'map',
+                style: 'mapbox://styles/mapbox/light-v11',
+                center: [2.3522, 48.8566],
+                zoom: 13
+            });
+
+            const startInput = document.getElementById('startInput');
+            const endInput = document.getElementById('endInput');
+            const routeBtn = document.getElementById('routeBtn');
+            const loader = document.getElementById('loader');
+
+            let startMarker = null;
+            let endMarker = null;
+
+            map.on('load', () => {
+                map.addSource('shady-route', { type: 'geojson', data: null });
+                map.addLayer({
+                    'id': 'shady-route-layer', 'type': 'line', 'source': 'shady-route',
+                    'layout': { 'line-join': 'round', 'line-cap': 'round' },
+                    'paint': {
+                        'line-width': 6, 'line-opacity': 0.9,
+                        'line-gradient': ['interpolate', ['linear'], ['get', 'shade_percent'], 0, '#ffc107', 0.2, '#f57c00', 0.5, '#7b1fa2', 0.8, '#4a0072']
+                    }
+                });
+            });
+
+            const popup = new mapboxgl.Popup({ closeButton: false, closeOnClick: false });
+
+            map.on('mouseenter', 'shady-route-layer', (e) => {
+                map.getCanvas().style.cursor = 'pointer';
+                const props = e.features[0].properties;
+                let html = `Ombre : <strong>${(props.shade_percent * 100).toFixed(0)}%</strong>`;
+                popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+            });
+
+            map.on('mouseleave', 'shady-route-layer', () => {
+                map.getCanvas().style.cursor = '';
+                popup.remove();
+            });
+
+            routeBtn.addEventListener('click', findRoute);
+            startInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') findRoute(); });
+            endInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') findRoute(); });
+
+            async function findRoute() {
+                const startAddress = startInput.value;
+                const endAddress = endInput.value;
+                if (!startAddress || !endAddress) {
+                    alert("Veuillez entrer une adresse de départ et d'arrivée.");
+                    return;
+                }
+
+                loader.style.display = 'inline';
+                routeBtn.disabled = true;
+                routeBtn.textContent = 'Calcul...';
+
+                if (startMarker) startMarker.remove();
+                if (endMarker) endMarker.remove();
+                if (map.getSource('shady-route')) {
+                    map.getSource('shady-route').setData({ type: 'FeatureCollection', features: [] });
+                }
+
+                try {
+                    const apiUrl = `http://127.0.0.1:8000/calculer-itineraire?adresse_depart=${encodeURIComponent(startAddress)}&adresse_arrivee=${encodeURIComponent(endAddress)}`;
+                    const response = await fetch(apiUrl);
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(`Erreur du serveur: ${errorData.detail || response.statusText}`);
+                    }
+
+                    const data = await response.json();
+                    console.log("Données d'itinéraires reçues:", data);
+
+                    if (data.itineraire_segmente && data.itineraire_segmente.features.length > 0) {
+                        map.getSource('shady-route').setData(data.itineraire_segmente);
+                        
+                        const bounds = new mapboxgl.LngLatBounds();
+                        const allCoords = data.itineraire_segmente.features.flatMap(feature => {
+                            let coords = feature.geometry.coordinates;
+                            while (Array.isArray(coords[0][0])) { coords = coords.flat(); }
+                            return coords;
+                        });
+                        
+                        if (allCoords.length > 0) {
+                            const startPoint = allCoords[0];
+                            const endPoint = allCoords[allCoords.length - 1];
+                            
+                            startMarker = new mapboxgl.Marker({color: '#007bff'}).setLngLat(startPoint).addTo(map);
+                            endMarker = new mapboxgl.Marker({color: '#28a745'}).setLngLat(endPoint).addTo(map);
+                            
+                            allCoords.forEach(coord => bounds.extend(coord));
+                            
+                            if (!bounds.isEmpty()){
+                                map.fitBounds(bounds, { padding: 80 });
+                            }
+                        }
+                    } else {
+                        alert("Aucun itinéraire n'a pu être trouvé.");
+                    }
+
+                } catch (error) {
+                    console.error("Erreur lors du calcul de l'itinéraire:", error);
+                    alert(`Une erreur est survenue: ${error.message}`);
+                } finally {
+                    loader.style.display = 'none';
+                    routeBtn.disabled = false;
+                    routeBtn.textContent = "Trouver l'Itinéraire Ombragé";
+                }
+            }
+        });
+    </script>
+
+</body>
+</html>

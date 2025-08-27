@@ -1,0 +1,1 @@
+https://app.shadowmap.org/?lat=48.88661&lng=2.37521&zoom=16.30&azimuth=-0.02884&basemap=map&elevation=nextzen&f=29.0&hud=true&polar=0.52360&time=1756230121062&vq=1
