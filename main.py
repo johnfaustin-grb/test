@@ -84,6 +84,7 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
         gdf_buildings = gdf_buildings[~gdf_buildings.is_empty & gdf_buildings.is_valid]
         if not gdf_buildings.empty:
             gdf_buildings = gdf_buildings.explode(index_parts=True).reset_index(drop=True)
+            gdf_buildings['building_id'] = gdf_buildings.index
         gdf_buildings['height'] = 15
 
         # 4. ANALYSE DES OMBRES (AVEC CACHE)
@@ -101,8 +102,13 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
             shadows.crs = gdf_buildings.crs # Assurez-vous que le CRS est défini
         else:
             print("Calcul des ombres (cache non trouvé)...")
-            shadows = bd.cal_sunshadows(gdf_buildings, sun_time_str)
-            shadows.crs = gdf_buildings.crs
+            if gdf_buildings.empty:
+                print("Aucun bâtiment trouvé, pas de calcul d'ombres.")
+                shadows = gpd.GeoDataFrame(geometry=[], crs=gdf_buildings.crs)
+            else:
+                shadows = bd.cal_sunshadows(gdf_buildings, sun_time_str)
+                shadows.crs = gdf_buildings.crs
+
             print("Sauvegarde des ombres dans le cache...")
             shadows.to_parquet(shadow_cache_path)
 
