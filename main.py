@@ -5,10 +5,12 @@ import osmnx as ox
 import pybdshadow as bd
 from datetime import datetime
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon, LineString
+from shapely.geometry import Point, Polygon, MultiPolygon, LineString
 from shapely.ops import unary_union
 import json
 import networkx as nx
+import os
+import pickle
 
 # --- 1. INITIALISATION DE L'APPLICATION API ---
 app = FastAPI(
@@ -40,41 +42,85 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
         gdf_line = gpd.GeoDataFrame([{'geometry': line}], crs='EPSG:4326')
         target_crs = 'EPSG:2154'
         gdf_line_proj = gdf_line.to_crs(target_crs)
-        analysis_polygon_proj = gdf_line_proj.buffer(750).unary_union
+        analysis_polygon_proj = gdf_line_proj.buffer(500).unary_union
         gdf_poly_proj = gpd.GeoDataFrame(geometry=[analysis_polygon_proj], crs=target_crs)
         analysis_polygon = gdf_poly_proj.to_crs('EPSG:4326').iloc[0]['geometry']
 
-        # 2. TÉLÉCHARGEMENT DES DONNÉES
-        print("Téléchargement des données...")
-        G = ox.graph_from_polygon(analysis_polygon, network_type='walk')
-        tags_buildings = {"building": True}
-        gdf_buildings = ox.features_from_polygon(analysis_polygon, tags=tags_buildings)
-        tags_water = {"natural": "water", "waterway": "riverbank"}
-        gdf_water = ox.features_from_polygon(analysis_polygon, tags=tags_water)
+        # 2. GESTION DES DONNÉES (CACHE)
+        bounds = analysis_polygon.bounds
+        cache_key = "_".join([f"{b:.5f}" for b in bounds])
+        cache_dir = "data_cache"
+        os.makedirs(cache_dir, exist_ok=True)
 
-        # 3. ANALYSE DES OMBRES
-        print("Analyse des ombres...")
+        graph_path = os.path.join(cache_dir, f"graph_{cache_key}.pkl")
+        buildings_path = os.path.join(cache_dir, f"buildings_{cache_key}.parquet")
+        water_path = os.path.join(cache_dir, f"water_{cache_key}.parquet")
+
+        if os.path.exists(graph_path) and os.path.exists(buildings_path) and os.path.exists(water_path):
+            print("Chargement des données depuis le cache...")
+            with open(graph_path, 'rb') as f:
+                G = pickle.load(f)
+            gdf_buildings = gpd.read_parquet(buildings_path)
+            gdf_water = gpd.read_parquet(water_path)
+        else:
+            print("Téléchargement des données (cache non trouvé)...")
+            G = ox.graph_from_polygon(analysis_polygon, network_type='walk')
+            tags_buildings = {"building": True}
+            gdf_buildings = ox.features_from_polygon(analysis_polygon, tags_buildings)
+            tags_water = {"natural": "water", "waterway": "riverbank"}
+            gdf_water = ox.features_from_polygon(analysis_polygon, tags_water)
+
+            print("Sauvegarde des données dans le cache...")
+            with open(graph_path, 'wb') as f:
+                pickle.dump(G, f)
+            gdf_buildings.to_parquet(buildings_path)
+            gdf_water.to_parquet(water_path)
+
+        # 3. NETTOYAGE DES DONNÉES DE BÂTIMENTS
+        print("Nettoyage des données de bâtiments...")
         if 'bridge' in gdf_buildings.columns:
             gdf_buildings = gdf_buildings[gdf_buildings['bridge'].isnull()]
         gdf_buildings = gdf_buildings[gdf_buildings['geometry'].apply(lambda geom: isinstance(geom, (Polygon, MultiPolygon)))]
-        gdf_buildings = gdf_buildings[~gdf_buildings.is_empty]
-        gdf_buildings = gdf_buildings[gdf_buildings.is_valid]
-        gdf_buildings = gdf_buildings.explode(index_parts=True)
-        gdf_buildings = gdf_buildings.reset_index(drop=True)
-        gdf_buildings['building_id'] = gdf_buildings.index
+        gdf_buildings = gdf_buildings[~gdf_buildings.is_empty & gdf_buildings.is_valid]
+        if not gdf_buildings.empty:
+            gdf_buildings = gdf_buildings.explode(index_parts=True).reset_index(drop=True)
+            gdf_buildings['building_id'] = gdf_buildings.index
         gdf_buildings['height'] = 15
+
+        # 4. ANALYSE DES OMBRES (AVEC CACHE)
+        print("Analyse des ombres...")
         sun_time_obj = datetime.now()
         sun_time_str = sun_time_obj.strftime('%Y-%m-%d %H:%M:%S')
-        shadows = bd.cal_sunshadows(gdf_buildings, sun_time_str)
-        shadows.crs = gdf_buildings.crs
+        sun_time_hour_str = sun_time_obj.strftime('%Y-%m-%d-%H')
+        shadow_cache_dir = "shadow_cache"
+        os.makedirs(shadow_cache_dir, exist_ok=True)
+        shadow_cache_path = os.path.join(shadow_cache_dir, f"shadows_{cache_key}_{sun_time_hour_str}.parquet")
 
-        # 4. MODIFICATION DU GRAPHE AVEC LES COÛTS
-        print("Application des coûts au graphe...")
+        if os.path.exists(shadow_cache_path):
+            print("Chargement des ombres depuis le cache...")
+            shadows = gpd.read_parquet(shadow_cache_path)
+            shadows.crs = gdf_buildings.crs # Assurez-vous que le CRS est défini
+        else:
+            print("Calcul des ombres (cache non trouvé)...")
+            if gdf_buildings.empty:
+                print("Aucun bâtiment trouvé, pas de calcul d'ombres.")
+                shadows = gpd.GeoDataFrame(geometry=[], crs=gdf_buildings.crs)
+            else:
+                shadows = bd.cal_sunshadows(gdf_buildings, sun_time_str)
+                shadows.crs = gdf_buildings.crs
+
+            print("Sauvegarde des ombres dans le cache...")
+            shadows.to_parquet(shadow_cache_path)
+
+        # 5. MODIFICATION DU GRAPHE AVEC LES COÛTS (OPTIMISÉ)
+        print("Application des coûts au graphe (optimisé)...")
         G_proj = ox.project_graph(G, to_crs=target_crs)
         shadows_proj = shadows.to_crs(target_crs)
         water_proj = gdf_water.to_crs(target_crs)
-        total_shadow_area = unary_union(shadows_proj.geometry)
-        total_water_area = unary_union(water_proj.geometry)
+
+        # Création des index spatiaux pour une recherche rapide
+        shadows_sindex = shadows_proj.sindex
+        water_sindex = water_proj.sindex
 
         for u, v, key, data in G_proj.edges(keys=True, data=True):
             length = data.get('length', 0)
@@ -84,24 +130,48 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
 
             if 'geometry' in data:
                 edge_geom = data['geometry']
-                if edge_geom.intersects(total_water_area) and not is_bridge:
-                    cost = length * 1000
-                else:
-                    intersection = edge_geom.intersection(total_shadow_area)
-                    shade_length = intersection.length
-                    shade_percent = (shade_length / length) if length > 0 else 0
+
+                # Vérification rapide de l'intersection avec l'eau
+                possible_water_matches_idx = list(water_sindex.intersection(edge_geom.bounds))
+                if not is_bridge and possible_water_matches_idx:
+                    if any(water_proj.iloc[possible_water_matches_idx].intersects(edge_geom)):
+                        cost = length * 1000  # Pénalité forte pour l'eau
+                    else:
+                        # Calcul de l'ombre uniquement si pas dans l'eau
+                        possible_shadow_matches_idx = list(shadows_sindex.intersection(edge_geom.bounds))
+                        if possible_shadow_matches_idx:
+                            intersecting_shadows = shadows_proj.iloc[possible_shadow_matches_idx]
+                            # Union unaire uniquement sur les ombres candidates
+                            nearby_shadow_union = unary_union(intersecting_shadows.geometry)
+                            intersection = edge_geom.intersection(nearby_shadow_union)
+                            shade_length = intersection.length
+                            shade_percent = (shade_length / length) if length > 0 else 0
+                        cost = length * (1 + (1 - shade_percent) * 2)
+                else: # Pas d'intersection avec l'eau ou c'est un pont
+                    possible_shadow_matches_idx = list(shadows_sindex.intersection(edge_geom.bounds))
+                    if possible_shadow_matches_idx:
+                        intersecting_shadows = shadows_proj.iloc[possible_shadow_matches_idx]
+                        nearby_shadow_union = unary_union(intersecting_shadows.geometry)
+                        intersection = edge_geom.intersection(nearby_shadow_union)
+                        shade_length = intersection.length
+                        shade_percent = (shade_length / length) if length > 0 else 0
                     cost = length * (1 + (1 - shade_percent) * 2)
             else:
-                 cost = length * 1000
+                 cost = length * 1000  # Pas de géométrie, pénalité forte
             
             G_proj.edges[u, v, key]['cost'] = cost
             G_proj.edges[u, v, key]['shade_percent'] = shade_percent
 
-        # 5. CALCUL DE L'ITINÉRAIRE
+        # 6. CALCUL DE L'ITINÉRAIRE
         print("Calcul de l'itinéraire...")
-        start_node = ox.nearest_nodes(G, X=start_coords[1], Y=start_coords[0])
-        end_node = ox.nearest_nodes(G, X=end_coords[1], Y=end_coords[0])
-        
+        # On projette les coordonnées de départ et d'arrivée dans le CRS du graphe projeté
+        start_geom_proj = gpd.GeoSeries([Point(start_coords[::-1])], crs='EPSG:4326').to_crs(target_crs).iloc[0]
+        end_geom_proj = gpd.GeoSeries([Point(end_coords[::-1])], crs='EPSG:4326').to_crs(target_crs).iloc[0]
+
+        # On cherche les noeuds les plus proches sur le graphe projeté
+        start_node = ox.nearest_nodes(G_proj, X=start_geom_proj.x, Y=start_geom_proj.y)
+        end_node = ox.nearest_nodes(G_proj, X=end_geom_proj.x, Y=end_geom_proj.y)
+
         try:
             route_nodes = nx.shortest_path(G_proj, source=start_node, target=end_node, weight='cost')
         except nx.NetworkXNoPath:
@@ -111,7 +181,7 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
             except nx.NetworkXNoPath:
                 raise HTTPException(status_code=404, detail="Impossible de trouver un chemin. Les points sont peut-être dans des zones non connectées.")
 
-        # 6. FORMATAGE DE LA RÉPONSE
+        # 7. FORMATAGE DE LA RÉPONSE
         print("Formatage de la réponse GeoJSON...")
         features = []
         for u, v in zip(route_nodes[:-1], route_nodes[1:]):
@@ -128,6 +198,11 @@ async def calculer_itineraire(adresse_depart: str, adresse_arrivee: str):
         gdf_route = gpd.GeoDataFrame.from_features(features, crs=target_crs)
         web_crs = 'EPSG:4326'
         gdf_route_web = gdf_route.to_crs(web_crs)
+
+        # Log pour vérification
+        print("--- GeoJSON de la réponse ---")
+        print(gdf_route_web.to_json())
+        print("-----------------------------")
 
         return JSONResponse(content={
             "heure_analyse": sun_time_str,
